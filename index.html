@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>VibeCoding WebGL 手势水波纹</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      background: #050508;
+      font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+      touch-action: none; user-select: none; -webkit-user-select: none;
+    }
+    #container {
+      position: relative;
+      width: 100vw; height: 100vh;
+      display: flex; justify-content: center; align-items: center;
+      background: #050508;
+    }
+    .layer {
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      max-width: 100%; max-height: 100%;
+      width: auto; height: auto;
+      aspect-ratio: 4 / 3;
+      display: block;
+    }
+    #overlay { pointer-events: none; z-index: 5; }
+    #loading {
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 20; text-align: center; pointer-events: none;
+      transition: opacity 0.6s ease;
+    }
+    #loading.hidden { opacity: 0; }
+    .spinner {
+      width: 44px; height: 44px; margin: 0 auto 18px;
+      border: 3px solid rgba(255,255,255,0.08);
+      border-top-color: rgba(80,180,255,0.85);
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #loading p { color: rgba(255,255,255,0.55); font-size: 15px; letter-spacing: 0.5px; line-height: 1.6; }
+    #loading .step { font-size: 13px; color: rgba(255,255,255,0.35); margin-top: 6px; }
+    #info-bar {
+      position: absolute; bottom: 24px; left: 0; right: 0;
+      text-align: center; z-index: 10; pointer-events: none;
+    }
+    #info-bar span {
+      display: inline-block; padding: 8px 20px;
+      background: rgba(0,0,0,0.55);
+      backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+      border-radius: 20px; color: rgba(255,255,255,0.5);
+      font-size: 13px; letter-spacing: 1px;
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+    #fps {
+      position: absolute; top: 18px; right: 20px;
+      z-index: 10; color: rgba(255,255,255,0.2);
+      font-size: 12px; font-family: "SF Mono", "Fira Code", monospace;
+      pointer-events: none;
+    }
+    video { display: none; }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <canvas id="glcanvas" class="layer"></canvas>
+    <canvas id="overlay" class="layer"></canvas>
+
+    <div id="loading">
+      <div class="spinner"></div>
+      <p>正在启动 WebGL 交互体验...</p>
+      <div class="step">加载 MediaPipe 模型</div>
+    </div>
+
+    <div id="info-bar"><span>伸出手掌，指尖划过画面触发细腻水波</span></div>
+    <div id="fps">-- FPS</div>
+  </div>
+
+  <video id="video" playsinline muted></video>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js"></script>
+
+  <script>
+  // ============================================================
+  //  Configuration
+  // ============================================================
+  const CONFIG = {
+    canvasW: 960,
+    canvasH: 720,
+    simScale: 0.6,          // simulation resolution ratio
+    damping: 0.994,         // very slow decay for realistic water
+    rippleStrength: 0.28,   // injection impulse
+    refractStrength: 0.085, // refraction UV displacement scale
+    maxInjectPerFrame: 16,
+  };
+
+  // ============================================================
+  //  WebGL2 Helpers
+  // ============================================================
+  function createShader(gl, type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      console.error(gl.getShaderInfoLog(s));
+      gl.deleteShader(s);
+      return null;
+    }
+    return s;
+  }
+
+  function createProgram(gl, vsSrc, fsSrc) {
+    const vs = createShader(gl, gl.VERTEX_SHADER, vsSrc);
+    const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+    const p = gl.createProgram();
+    gl.attachShader(p, vs);
+    gl.attachShader(p, fs);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      console.error(gl.getProgramInfoLog(p));
+      return null;
+    }
+    return p;
+  }
+
+  function createFloatFBO(gl, w, h) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+      console.warn('Float FBO incomplete on this device');
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { tex, fbo };
+  }
+
+  // ============================================================
+  //  DOM Refs
+  // ============================================================
+  const video   = document.getElementById('video');
+  const canvas  = document.getElementById('glcanvas');
+  const overlay = document.getElementById('overlay');
+  const loadingEl = document.getElementById('loading');
+  const stepEl    = loadingEl.querySelector('.step');
+  const fpsEl     = document.getElementById('fps');
+  const octx      = overlay.getContext('2d');
+
+  const W = CONFIG.canvasW;
+  const H = CONFIG.canvasH;
+  canvas.width  = W; canvas.height  = H;
+  overlay.width = W; overlay.height = H;
+
+  // ============================================================
+  //  WebGL2 Context
+  // ============================================================
+  const gl = canvas.getContext('webgl2', { alpha: false, antialias: false, premultipliedAlpha: false });
+  if (!gl) {
+    alert('您的浏览器不支持 WebGL2，请使用 Chrome / Edge / Safari 最新版');
+    throw new Error('WebGL2 not supported');
+  }
+
+  // ============================================================
+  //  Shaders
+  // ============================================================
+  const VS = `#version 300 es
+  layout(location = 0) in vec2 a_pos;
+  layout(location = 1) in vec2 a_uv;
+  out vec2 v_uv;
+  void main() {
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+    v_uv = a_uv;
+  }`;
+
+  const SIM_FS = `#version 300 es
+  precision highp float;
+  in vec2 v_uv;
+  out vec4 outColor;
+
+  uniform sampler2D u_curr;
+  uniform sampler2D u_prev;
+  uniform float u_damping;
+  uniform vec2 u_texel;
+
+  uniform vec2 u_points[16];
+  uniform float u_strengths[16];
+  uniform int u_count;
+
+  void main() {
+    float c = texture(u_curr, v_uv).r;
+    float p = texture(u_prev, v_uv).r;
+
+    float l = texture(u_curr, v_uv + vec2(-u_texel.x, 0.0)).r;
+    float r = texture(u_curr, v_uv + vec2( u_texel.x, 0.0)).r;
+    float t = texture(u_curr, v_uv + vec2(0.0,  u_texel.y)).r;
+    float b = texture(u_curr, v_uv + vec2(0.0, -u_texel.y)).r;
+
+    // Discrete 2D wave equation with damping
+    float next = (l + r + t + b) * 0.5 - p;
+    next *= u_damping;
+
+    // Gaussian injection at fingertip coordinates
+    for (int i = 0; i < 16; i++) {
+      if (i >= u_count) break;
+      float d = distance(v_uv, u_points[i]);
+      float falloff = exp(-d * d * 1500.0);
+      next += u_strengths[i] * falloff;
+    }
+
+    outColor = vec4(next, 0.0, 0.0, 1.0);
+  }`;
+
+  const RENDER_FS = `#version 300 es
+  precision highp float;
+  in vec2 v_uv;
+  out vec4 outColor;
+
+  uniform sampler2D u_height;
+  uniform sampler2D u_video;
+  uniform vec2 u_htexel;
+  uniform float u_refract;
+
+  void main() {
+    // Sobel-like smooth gradient from 8-neighbor samples
+    float c  = texture(u_height, v_uv).r;
+    float r  = texture(u_height, v_uv + vec2( u_htexel.x, 0.0)).r;
+    float l  = texture(u_height, v_uv + vec2(-u_htexel.x, 0.0)).r;
+    float t  = texture(u_height, v_uv + vec2(0.0,  u_htexel.y)).r;
+    float b_ = texture(u_height, v_uv + vec2(0.0, -u_htexel.y)).r;
+    float tr = texture(u_height, v_uv + vec2( u_htexel.x,  u_htexel.y)).r;
+    float tl = texture(u_height, v_uv + vec2(-u_htexel.x,  u_htexel.y)).r;
+    float br = texture(u_height, v_uv + vec2( u_htexel.x, -u_htexel.y)).r;
+    float bl = texture(u_height, v_uv + vec2(-u_htexel.x, -u_htexel.y)).r;
+
+    vec2 grad;
+    grad.x = (r - l) * 0.5 + (tr + br - tl - bl) * 0.25;
+    grad.y = (t - b_) * 0.5 + (tr + tl - br - bl) * 0.25;
+
+    // Refraction offset driven by height gradient
+    vec2 refractUV = v_uv + grad * u_refract;
+
+    // Mirror-X + flip-Y for camera self-view
+    vec2 videoUV = vec2(1.0 - refractUV.x, 1.0 - refractUV.y);
+
+    vec3 col = texture(u_video, videoUV).rgb;
+
+    // Specular highlight on wave slope
+    float slope = length(grad);
+    float spec = pow(max(0.0, slope), 3.0) * 0.35;
+    col += vec3(spec * 0.4, spec * 0.75, spec * 1.0);
+
+    // Subtle blue caustic tint at deeper slopes
+    col += vec3(0.0, 0.015, 0.035) * slope;
+
+    outColor = vec4(col, 1.0);
+  }`;
+
+  // ============================================================
+  //  Programs & Geometry
+  // ============================================================
+  const simProg = createProgram(gl, VS, SIM_FS);
+  const renProg = createProgram(gl, VS, RENDER_FS);
+
+  // Full-screen quad (interleaved: pos.xy, uv.xy)
+  const quadBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1,-1, 0,0,   1,-1, 1,0,   -1, 1, 0,1,
+    -1, 1, 0,1,   1,-1, 1,0,    1, 1, 1,1
+  ]), gl.STATIC_DRAW);
+
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
+  gl.bindVertexArray(null);
+
+  // ============================================================
+  //  Ping-Pong FBOs (3 buffers for safe rotation)
+  // ============================================================
+  const simW = Math.floor(W * CONFIG.simScale);
+  const simH = Math.floor(H * CONFIG.simScale);
+  const pp = [createFloatFBO(gl, simW, simH), createFloatFBO(gl, simW, simH), createFloatFBO(gl, simW, simH)];
+
+  // Clear all to 0
+  gl.clearColor(0, 0, 0, 1);
+  for (let i = 0; i < 3; i++) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, pp[i].fbo);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // ============================================================
+  //  Video Texture
+  // ============================================================
+  const vidTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, vidTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  // ============================================================
+  //  Uniform Locations
+  // ============================================================
+  const simLocs = {
+    curr:      gl.getUniformLocation(simProg, 'u_curr'),
+    prev:      gl.getUniformLocation(simProg, 'u_prev'),
+    damping:   gl.getUniformLocation(simProg, 'u_damping'),
+    texel:     gl.getUniformLocation(simProg, 'u_texel'),
+    points:    gl.getUniformLocation(simProg, 'u_points'),
+    strengths: gl.getUniformLocation(simProg, 'u_strengths'),
+    count:     gl.getUniformLocation(simProg, 'u_count'),
+  };
+  const renLocs = {
+    height:  gl.getUniformLocation(renProg, 'u_height'),
+    video:   gl.getUniformLocation(renProg, 'u_video'),
+    htexel:  gl.getUniformLocation(renProg, 'u_htexel'),
+    refract: gl.getUniformLocation(renProg, 'u_refract'),
+  };
+
+  // ============================================================
+  //  MediaPipe Hands
+  // ============================================================
+  const injectQueue = [];
+  let prevHands = [];
+  let latestLandmarks = null;
+  const HAND_CONNECTIONS = [
+    [0,1],[1,2],[2,3],[3,4],
+    [0,5],[5,6],[6,7],[7,8],
+    [0,9],[9,10],[10,11],[11,12],
+    [0,13],[13,14],[14,15],[15,16],
+    [0,17],[17,18],[18,19],[19,20],
+    [5,9],[9,13],[13,17]
+  ];
+  const TIP_INDICES = [4,8,12,16,20];
+
+  async function initMediaPipe() {
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${file}`
+    });
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+
+    hands.onResults((results) => {
+      latestLandmarks = results.multiHandLandmarks || null;
+      const newPrev = [];
+
+      if (results.multiHandLandmarks) {
+        const indices = [0, ...TIP_INDICES]; // wrist + fingertips
+        for (let h = 0; h < results.multiHandLandmarks.length && h < 2; h++) {
+          const lm = results.multiHandLandmarks[h];
+          // Mirror X so the self-view feels natural
+          const pts = indices.map(i => ({ x: 1.0 - lm[i].x, y: lm[i].y }));
+
+          if (prevHands[h]) {
+            for (let i = 0; i < pts.length; i++) {
+              const dx = pts[i].x - prevHands[h][i].x;
+              const dy = pts[i].y - prevHands[h][i].y;
+              const dist = Math.sqrt(dx * dx + dy * dy);
+              if (dist > 0.0025) {
+                // Strength linked to movement speed for organic feel
+                const strength = CONFIG.rippleStrength * Math.min(1.0, dist * 14.0 + 0.12);
+                injectQueue.push({ x: pts[i].x, y: pts[i].y, strength });
+              }
+            }
+          } else {
+            // New hand appearance — gentle splash
+            for (let i = 0; i < pts.length; i++) {
+              injectQueue.push({ x: pts[i].x, y: pts[i].y, strength: CONFIG.rippleStrength * 0.5 });
+            }
+          }
+          newPrev[h] = pts;
+        }
+      }
+      prevHands = newPrev;
+    });
+
+    stepEl.textContent = '启动摄像头...';
+    const camera = new Camera(video, {
+      onFrame: async () => {
+        try { await hands.send({ image: video }); } catch (_) {}
+      },
+      width: W,
+      height: H,
+    });
+    await camera.start();
+    stepEl.textContent = '摄像头已就绪';
+  }
+
+  // ============================================================
+  //  Overlay Drawing (hand skeleton)
+  // ============================================================
+  function drawOverlay() {
+    octx.clearRect(0, 0, W, H);
+    if (!latestLandmarks) return;
+
+    for (const lm of latestLandmarks) {
+      octx.strokeStyle = 'rgba(0, 220, 255, 0.22)';
+      octx.lineWidth = 1.8;
+      for (const [a, b] of HAND_CONNECTIONS) {
+        octx.beginPath();
+        octx.moveTo(lm[a].x * W, lm[a].y * H);
+        octx.lineTo(lm[b].x * W, lm[b].y * H);
+        octx.stroke();
+      }
+      for (const idx of TIP_INDICES) {
+        const x = lm[idx].x * W, y = lm[idx].y * H;
+        octx.fillStyle = 'rgba(0, 200, 255, 0.55)';
+        octx.beginPath();
+        octx.arc(x, y, 5, 0, Math.PI * 2);
+        octx.fill();
+        octx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+        octx.beginPath();
+        octx.arc(x, y, 2, 0, Math.PI * 2);
+        octx.fill();
+      }
+    }
+  }
+
+  // ============================================================
+  //  Simulation & Render Passes
+  // ============================================================
+  let curr = 0, prev = 1, next = 2;
+
+  function stepSimulation() {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, pp[next].fbo);
+    gl.viewport(0, 0, simW, simH);
+
+    gl.useProgram(simProg);
+    gl.bindVertexArray(vao);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, pp[curr].tex);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, pp[prev].tex);
+
+    gl.uniform1i(simLocs.curr, 0);
+    gl.uniform1i(simLocs.prev, 1);
+    gl.uniform1f(simLocs.damping, CONFIG.damping);
+    gl.uniform2f(simLocs.texel, 1.0 / simW, 1.0 / simH);
+
+    const count = Math.min(injectQueue.length, CONFIG.maxInjectPerFrame);
+    gl.uniform1i(simLocs.count, count);
+    const ptsArr = new Float32Array(16 * 2);
+    const strArr = new Float32Array(16);
+    for (let i = 0; i < count; i++) {
+      ptsArr[i * 2]     = injectQueue[i].x;
+      ptsArr[i * 2 + 1] = injectQueue[i].y;
+      strArr[i]         = injectQueue[i].strength;
+    }
+    gl.uniform2fv(simLocs.points, ptsArr);
+    gl.uniform1fv(simLocs.strengths, strArr);
+    injectQueue.length = 0;
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // rotate: curr <- next, prev <- curr, next <- prev
+    const t = prev; prev = curr; curr = next; next = t;
+  }
+
+  function renderPass() {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, W, H);
+
+    gl.useProgram(renProg);
+    gl.bindVertexArray(vao);
+
+    // Upload latest video frame to GPU
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, vidTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+    }
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, pp[curr].tex);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, vidTex);
+
+    gl.uniform1i(renLocs.height, 0);
+    gl.uniform1i(renLocs.video, 1);
+    gl.uniform2f(renLocs.htexel, 1.0 / simW, 1.0 / simH);
+    gl.uniform1f(renLocs.refract, CONFIG.refractStrength);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  // ============================================================
+  //  Main Loop
+  // ============================================================
+  let frameCount = 0;
+  let fpsTime = performance.now();
+
+  function loop() {
+    stepSimulation();
+    renderPass();
+    drawOverlay();
+
+    frameCount++;
+    const now = performance.now();
+    if (now - fpsTime >= 1000) {
+      fpsEl.textContent = Math.round((frameCount * 1000) / (now - fpsTime)) + ' FPS';
+      frameCount = 0;
+      fpsTime = now;
+    }
+    requestAnimationFrame(loop);
+  }
+
+  // ============================================================
+  //  Boot
+  // ============================================================
+  async function boot() {
+    try {
+      await initMediaPipe();
+    } catch (err) {
+      loadingEl.querySelector('p').textContent = '启动失败';
+      stepEl.textContent = err.message;
+      console.error(err);
+      return;
+    }
+    setTimeout(() => loadingEl.classList.add('hidden'), 700);
+    loop();
+  }
+
+  if (typeof Hands !== 'undefined' && typeof Camera !== 'undefined') {
+    boot();
+  } else {
+    stepEl.textContent = '正在加载 MediaPipe 库...';
+    const check = setInterval(() => {
+      if (typeof Hands !== 'undefined' && typeof Camera !== 'undefined') {
+        clearInterval(check);
+        boot();
+      }
+    }, 200);
+  }
+  </script>
+</body>
+</html>
